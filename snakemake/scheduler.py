@@ -1,37 +1,31 @@
 __author__ = "Johannes Köster"
-__copyright__ = "Copyright 2021, Johannes Köster"
+__copyright__ = "Copyright 2022, Johannes Köster"
 __email__ = "johannes.koester@uni-due.de"
 __license__ = "MIT"
 
+import asyncio
+from collections import defaultdict
+import math
 import os, signal, sys
 import threading
-import operator
-import time
-import math
-import asyncio
 
 from functools import partial
-from collections import defaultdict
-from itertools import chain, accumulate, product
+from itertools import chain, accumulate
 from contextlib import ContextDecorator
+import time
 
-
-from snakemake.executors import DryrunExecutor, TouchExecutor, CPUExecutor
-from snakemake.executors import (
-    GenericClusterExecutor,
-    SynchronousClusterExecutor,
-    DRMAAExecutor,
-    KubernetesExecutor,
-    TibannaExecutor,
-)
-from snakemake.executors.google_lifesciences import GoogleLifeSciencesExecutor
-from snakemake.executors.ga4gh_tes import TaskExecutionServiceExecutor
-from snakemake.exceptions import RuleException, WorkflowError, print_exception
-from snakemake.shell import shell
+from snakemake_interface_executor_plugins.scheduler import JobSchedulerExecutorInterface
+from snakemake_interface_executor_plugins.registry import ExecutorPluginRegistry
+from snakemake_interface_executor_plugins.registry import Plugin as ExecutorPlugin
+from snakemake_interface_executor_plugins.settings import ExecMode
 from snakemake.common import async_run
+
+from snakemake.exceptions import RuleException, WorkflowError, print_exception
 from snakemake.logging import logger
 
 from fractions import Fraction
+
+registry = ExecutorPluginRegistry()
 
 
 def cumsum(iterable, zero=[0]):
@@ -39,338 +33,108 @@ def cumsum(iterable, zero=[0]):
 
 
 _ERROR_MSG_FINAL = (
-    "Exiting because a job execution failed. " "Look above for error message"
+    "Exiting because a job execution failed. Look above for error message"
+)
+
+_ERROR_MSG_ISSUE_823 = (
+    "BUG: Out of jobs ready to be started, but not all files built yet."
+    " Please check https://github.com/snakemake/snakemake/issues/823 for more information."
 )
 
 
 class DummyRateLimiter(ContextDecorator):
-    def __enter__(self):
+    async def __aenter__(self):
         return self
 
-    def __exit__(self, *args):
+    async def __aexit__(self, *args):
         return False
 
 
-class JobScheduler:
-    def __init__(
-        self,
-        workflow,
-        dag,
-        local_cores=1,
-        dryrun=False,
-        touch=False,
-        cluster=None,
-        cluster_status=None,
-        cluster_config=None,
-        cluster_sync=None,
-        drmaa=None,
-        drmaa_log_dir=None,
-        kubernetes=None,
-        container_image=None,
-        tibanna=None,
-        tibanna_sfn=None,
-        google_lifesciences=None,
-        google_lifesciences_regions=None,
-        google_lifesciences_location=None,
-        google_lifesciences_cache=False,
-        tes=None,
-        precommand="",
-        preemption_default=None,
-        preemptible_rules=None,
-        tibanna_config=False,
-        jobname=None,
-        quiet=False,
-        printreason=False,
-        printshellcmds=False,
-        keepgoing=False,
-        max_jobs_per_second=None,
-        max_status_checks_per_second=100,
-        latency_wait=3,
-        greediness=1.0,
-        force_use_threads=False,
-        assume_shared_fs=True,
-        keepincomplete=False,
-        keepmetadata=True,
-        scheduler_type=None,
-        scheduler_ilp_solver=None,
-    ):
+class JobScheduler(JobSchedulerExecutorInterface):
+    def __init__(self, workflow, executor_plugin: ExecutorPlugin):
         """Create a new instance of KnapsackJobScheduler."""
-        from ratelimiter import RateLimiter
-
-        cores = workflow.global_resources["_cores"]
-
-        self.cluster = cluster
-        self.cluster_config = cluster_config
-        self.cluster_sync = cluster_sync
-        self.dag = dag
         self.workflow = workflow
-        self.dryrun = dryrun
-        self.touch = touch
-        self.quiet = quiet
-        self.keepgoing = keepgoing
+
+        self.dryrun = self.workflow.dryrun
+        self.touch = self.workflow.touch
+        self.quiet = self.workflow.output_settings.quiet
+        self.keepgoing = self.workflow.execution_settings.keep_going
         self.running = set()
         self.failed = set()
         self.finished_jobs = 0
-        self.greediness = 1
-        self.max_jobs_per_second = max_jobs_per_second
-        self.keepincomplete = keepincomplete
-        self.keepmetadata = keepmetadata
-        self.scheduler_type = scheduler_type
-        self.scheduler_ilp_solver = scheduler_ilp_solver
+        self.greediness = self.workflow.scheduling_settings.greediness
+        self.max_jobs_per_second = self.workflow.scheduling_settings.max_jobs_per_second
         self._tofinish = []
+        self._toerror = []
+        self.handle_job_success = True
+        self.update_resources = True
+        self.print_progress = not self.quiet and not self.dryrun
+        self.update_checkpoint_dependencies = not self.dryrun
+
+        nodes_unset = workflow.global_resources["_nodes"] is None
 
         self.global_resources = {
             name: (sys.maxsize if res is None else res)
             for name, res in workflow.global_resources.items()
         }
 
-        if workflow.global_resources["_nodes"] is not None:
+        if not nodes_unset:
             # Do not restrict cores locally if nodes are used (i.e. in case of cluster/cloud submission).
             self.global_resources["_cores"] = sys.maxsize
+
         self.resources = dict(self.global_resources)
 
-        use_threads = (
-            force_use_threads
-            or (os.name != "posix")
-            or cluster
-            or cluster_sync
-            or drmaa
-        )
         self._open_jobs = threading.Semaphore(0)
         self._lock = threading.Lock()
 
         self._errors = False
+        self._executor_error = None
         self._finished = False
         self._job_queue = None
-        self._submit_callback = self._noop
-        self._finish_callback = partial(
-            self._proceed,
-            update_dynamic=not self.dryrun,
-            print_progress=not self.quiet and not self.dryrun,
-        )
+        self._last_job_selection_empty = False
+        self._last_update_queue_input_jobs = 0
+        self.submit_callback = self._noop
+        self.finish_callback = self._proceed
+
+        if workflow.remote_execution_settings.immediate_submit:
+            self.submit_callback = self._proceed
+            self.finish_callback = self._noop
 
         self._local_executor = None
-        if dryrun:
-            self._executor = DryrunExecutor(
-                workflow,
-                dag,
-                printreason=printreason,
-                quiet=quiet,
-                printshellcmds=printshellcmds,
-                latency_wait=latency_wait,
-            )
-        elif touch:
-            self._executor = TouchExecutor(
-                workflow,
-                dag,
-                printreason=printreason,
-                quiet=quiet,
-                printshellcmds=printshellcmds,
-                latency_wait=latency_wait,
-            )
-        elif cluster or cluster_sync or (drmaa is not None):
-            if not workflow.immediate_submit:
-                # No local jobs when using immediate submit!
-                # Otherwise, they will fail due to missing input
-                self._local_executor = CPUExecutor(
-                    workflow,
-                    dag,
-                    local_cores,
-                    printreason=printreason,
-                    quiet=quiet,
-                    printshellcmds=printshellcmds,
-                    latency_wait=latency_wait,
-                    cores=local_cores,
-                    keepincomplete=keepincomplete,
-                    keepmetadata=keepmetadata,
-                )
-            if cluster or cluster_sync:
-                if cluster_sync:
-                    constructor = SynchronousClusterExecutor
-                else:
-                    constructor = partial(
-                        GenericClusterExecutor,
-                        statuscmd=cluster_status,
-                        max_status_checks_per_second=max_status_checks_per_second,
-                    )
 
-                self._executor = constructor(
-                    workflow,
-                    dag,
-                    None,
-                    submitcmd=(cluster or cluster_sync),
-                    cluster_config=cluster_config,
-                    jobname=jobname,
-                    printreason=printreason,
-                    quiet=quiet,
-                    printshellcmds=printshellcmds,
-                    latency_wait=latency_wait,
-                    assume_shared_fs=assume_shared_fs,
-                    keepincomplete=keepincomplete,
-                    keepmetadata=keepmetadata,
-                )
-                if workflow.immediate_submit:
-                    self._submit_callback = partial(
-                        self._proceed,
-                        update_dynamic=False,
-                        print_progress=False,
-                        update_resources=False,
-                        handle_job_success=False,
-                    )
-            else:
-                self._executor = DRMAAExecutor(
-                    workflow,
-                    dag,
-                    None,
-                    drmaa_args=drmaa,
-                    drmaa_log_dir=drmaa_log_dir,
-                    jobname=jobname,
-                    printreason=printreason,
-                    quiet=quiet,
-                    printshellcmds=printshellcmds,
-                    latency_wait=latency_wait,
-                    cluster_config=cluster_config,
-                    assume_shared_fs=assume_shared_fs,
-                    max_status_checks_per_second=max_status_checks_per_second,
-                    keepincomplete=keepincomplete,
-                    keepmetadata=keepmetadata,
-                )
-        elif kubernetes:
-            self._local_executor = CPUExecutor(
-                workflow,
-                dag,
-                local_cores,
-                printreason=printreason,
-                quiet=quiet,
-                printshellcmds=printshellcmds,
-                latency_wait=latency_wait,
-                cores=local_cores,
-                keepincomplete=keepincomplete,
-                keepmetadata=keepmetadata,
+        if self.workflow.local_exec:
+            self._executor = executor_plugin.executor(
+                self.workflow,
+                logger,
             )
-
-            self._executor = KubernetesExecutor(
-                workflow,
-                dag,
-                kubernetes,
-                container_image=container_image,
-                printreason=printreason,
-                quiet=quiet,
-                printshellcmds=printshellcmds,
-                latency_wait=latency_wait,
-                cluster_config=cluster_config,
-                keepincomplete=keepincomplete,
-                keepmetadata=keepmetadata,
-            )
-        elif tibanna:
-            self._local_executor = CPUExecutor(
-                workflow,
-                dag,
-                local_cores,
-                printreason=printreason,
-                quiet=quiet,
-                printshellcmds=printshellcmds,
-                use_threads=use_threads,
-                latency_wait=latency_wait,
-                cores=local_cores,
-                keepincomplete=keepincomplete,
-                keepmetadata=keepmetadata,
-            )
-
-            self._executor = TibannaExecutor(
-                workflow,
-                dag,
-                cores,
-                tibanna_sfn,
-                precommand=precommand,
-                tibanna_config=tibanna_config,
-                container_image=container_image,
-                printreason=printreason,
-                quiet=quiet,
-                printshellcmds=printshellcmds,
-                latency_wait=latency_wait,
-                keepincomplete=keepincomplete,
-                keepmetadata=keepmetadata,
-            )
-        elif google_lifesciences:
-            self._local_executor = CPUExecutor(
-                workflow,
-                dag,
-                local_cores,
-                printreason=printreason,
-                quiet=quiet,
-                printshellcmds=printshellcmds,
-                latency_wait=latency_wait,
-                cores=local_cores,
-            )
-
-            self._executor = GoogleLifeSciencesExecutor(
-                workflow,
-                dag,
-                cores,
-                container_image=container_image,
-                regions=google_lifesciences_regions,
-                location=google_lifesciences_location,
-                cache=google_lifesciences_cache,
-                printreason=printreason,
-                quiet=quiet,
-                printshellcmds=printshellcmds,
-                latency_wait=latency_wait,
-                preemption_default=preemption_default,
-                preemptible_rules=preemptible_rules,
-            )
-        elif tes:
-            self._local_executor = CPUExecutor(
-                workflow,
-                dag,
-                local_cores,
-                printreason=printreason,
-                quiet=quiet,
-                printshellcmds=printshellcmds,
-                latency_wait=latency_wait,
-                cores=local_cores,
-                keepincomplete=keepincomplete,
-            )
-
-            self._executor = TaskExecutionServiceExecutor(
-                workflow,
-                dag,
-                cores=local_cores,
-                printreason=printreason,
-                quiet=quiet,
-                printshellcmds=printshellcmds,
-                latency_wait=latency_wait,
-                tes_url=tes,
-                container_image=container_image,
-            )
-
         else:
-            self._executor = CPUExecutor(
-                workflow,
-                dag,
-                cores,
-                printreason=printreason,
-                quiet=quiet,
-                printshellcmds=printshellcmds,
-                use_threads=use_threads,
-                latency_wait=latency_wait,
-                cores=cores,
-                keepincomplete=keepincomplete,
-                keepmetadata=keepmetadata,
+            self._executor = executor_plugin.executor(
+                self.workflow,
+                logger,
             )
-        if self.max_jobs_per_second and not self.dryrun:
-            max_jobs_frac = Fraction(self.max_jobs_per_second).limit_denominator()
-            self.rate_limiter = RateLimiter(
-                max_calls=max_jobs_frac.numerator, period=max_jobs_frac.denominator
+            self._local_executor = (
+                ExecutorPluginRegistry()
+                .get_plugin("local")
+                .executor(
+                    self.workflow,
+                    logger,
+                )
             )
 
+        from throttler import Throttler
+
+        if not self.dryrun:
+            max_jobs_frac = Fraction(self.max_jobs_per_second).limit_denominator()
+            self.rate_limiter = Throttler(
+                rate_limit=max_jobs_frac.numerator, period=max_jobs_frac.denominator
+            )
         else:
             # essentially no rate limit
             self.rate_limiter = DummyRateLimiter()
 
         # Choose job selector (greedy or ILP)
         self.job_selector = self.job_selector_greedy
-        if scheduler_type == "ilp":
+        if self.workflow.scheduling_settings.scheduler == "ilp":
             import pulp
 
             if pulp.apis.LpSolverDefault is None:
@@ -391,24 +155,20 @@ class JobScheduler:
             pass
         self._open_jobs.release()
 
+    def executor_error_callback(self, exception):
+        with self._lock:
+            self._executor_error = exception
+            # next scheduling round to catch and raise error
+            self._open_jobs.release()
+
     @property
     def stats(self):
-        try:
-            return self._executor.stats
-        except AttributeError:
-            raise TypeError("Executor does not support stats")
+        return self._stats
 
     @property
     def open_jobs(self):
         """Return open jobs."""
-        jobs = self.dag.ready_jobs
-
-        if not self.dryrun:
-            jobs = [
-                job
-                for job in jobs
-                if not job.dynamic_input and not self.dag.dynamic(job)
-            ]
+        jobs = list(self.workflow.dag.ready_jobs)
         return jobs
 
     @property
@@ -416,14 +176,18 @@ class JobScheduler:
         """Return jobs to be scheduled including not yet ready ones."""
         return [
             job
-            for job in self.dag.needrun_jobs
-            if job not in self.running and not self.dag.finished(job)
+            for job in self.workflow.dag.needrun_jobs()
+            if job not in self.running
+            and not self.workflow.dag.finished(job)
+            and job not in self.failed
         ]
 
     def schedule(self):
         """Schedule jobs that are ready, maximizing cpu usage."""
         try:
             while True:
+                if self.workflow.dag.queue_input_jobs:
+                    self.update_queue_input_jobs()
                 # work around so that the wait does not prevent keyboard interrupts
                 # while not self._open_jobs.acquire(False):
                 #    time.sleep(1)
@@ -432,19 +196,24 @@ class JobScheduler:
                 # obtain needrun and running jobs in a thread-safe way
                 with self._lock:
                     self._finish_jobs()
+                    self._error_jobs()
                     needrun = set(self.open_jobs)
                     running = list(self.running)
                     errors = self._errors
+                    executor_error = self._executor_error
                     user_kill = self._user_kill
 
                 # handle errors
-                if user_kill or (not self.keepgoing and errors):
+                if user_kill or (not self.keepgoing and errors) or executor_error:
                     if user_kill == "graceful":
                         logger.info(
-                            "Will exit after finishing " "currently running jobs."
+                            "Will exit after finishing currently running jobs (scheduler)."
                         )
 
-                    if not running:
+                    if executor_error:
+                        print_exception(executor_error, self.workflow.linemaps)
+
+                    if executor_error or not running:
                         logger.info("Shutting down, this might take some time.")
                         self._executor.shutdown()
                         if not user_kill:
@@ -452,53 +221,104 @@ class JobScheduler:
                         return False
                     continue
 
-                # normal shutdown because all jobs have been finished
-                if not needrun and (not running or self.workflow.immediate_submit):
+                # all runnable jobs have finished, normal shutdown
+                if (
+                    not needrun
+                    and (
+                        not running
+                        or self.workflow.remote_execution_settings.immediate_submit
+                    )
+                    and not self.workflow.dag.has_unfinished_queue_input_jobs()
+                ):
                     self._executor.shutdown()
                     if errors:
                         logger.error(_ERROR_MSG_FINAL)
+                    # we still have unfinished jobs. this is not good. direct
+                    # user to github issue
+                    if self.remaining_jobs and not self.keepgoing:
+                        logger.error(_ERROR_MSG_ISSUE_823)
+                        logger.error(
+                            "Remaining jobs:\n"
+                            + "\n".join(
+                                " - " + str(job) + ": " + ", ".join(job.output)
+                                for job in self.remaining_jobs
+                            )
+                        )
+                        return False
                     return not errors
 
                 # continue if no new job needs to be executed
                 if not needrun:
+                    if self.workflow.dag.has_unfinished_queue_input_jobs():
+                        logger.info("Waiting for queue input...")
+                        # schedule a reevaluation in 10 seconds
+                        threading.Timer(
+                            self.workflow.execution_settings.queue_input_wait_time,
+                            lambda: self._open_jobs.release(),
+                        ).start()
                     continue
 
                 # select jobs by solving knapsack problem (omit with dryrun)
                 if self.dryrun:
                     run = needrun
                 else:
+                    # Reset params and resources because they might still contain TBDs
+                    # or old values from before files have been regenerated.
+                    # Now, they can be recalculated as all input is present and up to date.
+                    for job in needrun:
+                        job.reset_params_and_resources()
+
+                    logger.debug(f"Resources before job selection: {self.resources}")
                     logger.debug(
-                        "Resources before job selection: {}".format(self.resources)
+                        f"Ready jobs ({len(needrun)})"
+                        # + "\n\t".join(map(str, needrun))
                     )
-                    logger.debug(
-                        "Ready jobs ({}):\n\t".format(len(needrun))
-                        + "\n\t".join(map(str, needrun))
-                    )
+
+                    if not self._last_job_selection_empty:
+                        logger.info("Select jobs to execute...")
                     run = self.job_selector(needrun)
+                    self._last_job_selection_empty = not run
 
                     logger.debug(
-                        "Selected jobs ({}):\n\t".format(len(run))
-                        + "\n\t".join(map(str, run))
+                        f"Selected jobs ({len(run)})"
+                        # + "\n\t".join(map(str, run))
                     )
-                    logger.debug(
-                        "Resources after job selection: {}".format(self.resources)
-                    )
+                    logger.debug(f"Resources after job selection: {self.resources}")
+
                 # update running jobs
                 with self._lock:
                     self.running.update(run)
                     # remove from ready_jobs
-                    self.dag.register_running(run)
+                    self.workflow.dag.register_running(run)
 
-                # reset params and resources because they might contain TBDs
-                if not self.dryrun:
-                    for job in run:
-                        job.reset_params_and_resources()
+                if run:
+                    if not self.dryrun:
+                        logger.info(f"Execute {len(run)} jobs...")
 
-                # actually run jobs
-                local_runjobs = [job for job in run if job.is_local]
-                runjobs = [job for job in run if not job.is_local]
-                self.run(local_runjobs, executor=self._local_executor or self._executor)
-                self.run(runjobs)
+                    # actually run jobs
+                    local_runjobs = [job for job in run if job.is_local]
+                    runjobs = [job for job in run if not job.is_local]
+                    if local_runjobs:
+                        if (
+                            not self.workflow.remote_exec
+                            and not self.workflow.local_exec
+                        ):
+                            # Workflow uses a remote plugin and this scheduling run
+                            # is on the main process. Hence, we have to download
+                            # non-shared remote files for the local jobs.
+                            async_run(
+                                self.workflow.dag.retrieve_storage_inputs(
+                                    jobs=local_runjobs, also_missing_internal=True
+                                )
+                            )
+                        self.run(
+                            local_runjobs,
+                            executor=self._local_executor or self._executor,
+                        )
+                    if runjobs:
+                        self.run(runjobs)
+                elif not self.dryrun:
+                    logger.info("Waiting for more resources.")
         except (KeyboardInterrupt, SystemExit):
             logger.info(
                 "Terminating processes on user request, this might take some time."
@@ -508,19 +328,85 @@ class JobScheduler:
 
     def _finish_jobs(self):
         # must be called from within lock
-        for job, update_dynamic in self._tofinish:
-            self.dag.finish(job, update_dynamic=update_dynamic)
+        # clear the global tofinish such that parallel calls do not interfere
+        async def postprocess():
+            for job in self._tofinish:
+                if not self.workflow.dryrun:
+                    try:
+                        if self.workflow.exec_mode == ExecMode.DEFAULT:
+                            await job.postprocess(
+                                store_in_storage=not self.touch,
+                                handle_log=True,
+                                handle_touch=not self.touch,
+                                ignore_missing_output=self.touch,
+                            )
+                        elif self.workflow.exec_mode == ExecMode.SUBPROCESS:
+                            await job.postprocess(
+                                store_in_storage=False,
+                                handle_log=True,
+                                handle_touch=True,
+                            )
+                        else:
+                            await job.postprocess(
+                                # storage upload will be done after all jobs of
+                                # this remote job (e.g. in case of group) are finished
+                                # DAG.store_storage_outputs()
+                                store_in_storage=False,
+                                handle_log=True,
+                                handle_touch=True,
+                            )
+                    except (RuleException, WorkflowError) as e:
+                        # if an error occurs while processing job output,
+                        # we do the same as in case of errors during execution
+                        print_exception(e, self.workflow.linemaps)
+                        await job.postprocess(error=True)
+                        self._handle_error(job, postprocess_job=False)
+                        continue
+
+                if self.handle_job_success:
+                    self.get_executor(job).handle_job_success(job)
+
+                if self.update_resources:
+                    # normal jobs have len=1, group jobs have len>1
+                    self.finished_jobs += len(job)
+                    logger.debug(
+                        f"jobs registered as running before removal {self.running}"
+                    )
+                    self.running.remove(job)
+                    self._free_resources(job)
+
+                if self.print_progress:
+                    if job.is_group():
+                        for j in job:
+                            logger.job_finished(jobid=j.jobid)
+                    else:
+                        logger.job_finished(jobid=job.jobid)
+                    self.progress()
+
+                await self.workflow.dag.finish(
+                    job,
+                    update_checkpoint_dependencies=self.update_checkpoint_dependencies,
+                )
+
+        async_run(postprocess())
         self._tofinish.clear()
+
+    def update_queue_input_jobs(self):
+        currtime = time.time()
+        if currtime - self._last_update_queue_input_jobs >= 10:
+            self._last_update_queue_input_jobs = currtime
+            async_run(self.workflow.dag.update_queue_input_jobs())
+
+    def _error_jobs(self):
+        # must be called from within lock
+        for job in self._toerror:
+            self._handle_error(job)
+        self._toerror.clear()
 
     def run(self, jobs, executor=None):
         if executor is None:
             executor = self._executor
-        executor.run_jobs(
-            jobs,
-            callback=self._finish_callback,
-            submit_callback=self._submit_callback,
-            error_callback=self._error,
-        )
+        executor.run_jobs(jobs)
 
     def get_executor(self, job):
         if job.is_local and self._local_executor is not None:
@@ -531,50 +417,19 @@ class JobScheduler:
         pass
 
     def _free_resources(self, job):
-        for name, value in job.resources.items():
+        for name, value in job.scheduler_resources.items():
             if name in self.resources:
                 value = self.calc_resource(name, value)
                 self.resources[name] += value
 
-    def _proceed(
-        self,
-        job,
-        update_dynamic=True,
-        print_progress=False,
-        update_resources=True,
-        handle_job_success=True,
-    ):
+    def _proceed(self, job):
         """Do stuff after job is finished."""
         with self._lock:
-            if handle_job_success:
-                # by calling this behind the lock, we avoid race conditions
-                try:
-                    self.get_executor(job).handle_job_success(job)
-                except (RuleException, WorkflowError) as e:
-                    # if an error occurs while processing job output,
-                    # we do the same as in case of errors during execution
-                    print_exception(e, self.workflow.linemaps)
-                    self._handle_error(job)
-                    return
-
-            self._tofinish.append((job, update_dynamic))
-
-            if update_resources:
-                # normal jobs have len=1, group jobs have len>1
-                self.finished_jobs += len(job)
-                self.running.remove(job)
-                self._free_resources(job)
-
-            if print_progress:
-                if job.is_group():
-                    for j in job:
-                        logger.job_finished(jobid=j.jobid)
-                else:
-                    logger.job_finished(jobid=job.jobid)
-                self.progress()
+            logger.debug(f"Completion of job {job.rules} reported to scheduler.")
+            self._tofinish.append(job)
 
             if self.dryrun:
-                if not self.running:
+                if len(self.running) - len(self._tofinish) - len(self._toerror) <= 0:
                     # During dryrun, only release when all running jobs are done.
                     # This saves a lot of time, as self.open_jobs has to be
                     # evaluated less frequently.
@@ -583,33 +438,38 @@ class JobScheduler:
                 # go on scheduling if there is any free core
                 self._open_jobs.release()
 
-    def _error(self, job):
+    def error_callback(self, job):
         with self._lock:
-            self._handle_error(job)
+            self._toerror.append(job)
+            self._open_jobs.release()
 
-    def _handle_error(self, job):
+    def _handle_error(self, job, postprocess_job: bool = True):
         """Clear jobs and stop the workflow.
 
         If Snakemake is configured to restart jobs then the job might have
         "restart_times" left and we just decrement and let the scheduler
         try to run the job again.
         """
+        # must be called from within lock
+        if postprocess_job and not self.workflow.dryrun:
+            async_run(
+                job.postprocess(
+                    error=True,
+                )
+            )
         self.get_executor(job).handle_job_error(job)
         self.running.remove(job)
         self._free_resources(job)
         # attempt starts counting from 1, but the first attempt is not
         # a restart, hence we subtract 1.
         if job.restart_times > job.attempt - 1:
-            logger.info("Trying to restart job {}.".format(self.dag.jobid(job)))
+            logger.info(f"Trying to restart job {self.workflow.dag.jobid(job)}.")
             job.attempt += 1
             # add job to those being ready again
-            self.dag._ready_jobs.add(job)
+            self.workflow.dag._ready_jobs.add(job)
         else:
             self._errors = True
             self.failed.add(job)
-            if self.keepgoing:
-                logger.info("Job failed, going on with independent jobs.")
-        self._open_jobs.release()
 
     def exit_gracefully(self, *args):
         with self._lock:
@@ -624,7 +484,11 @@ class JobScheduler:
         from pulp import lpSum
         from stopit import ThreadingTimeout as Timeout, TimeoutException
 
-        logger.info("Select jobs to execute...")
+        if len(jobs) == 1:
+            logger.debug(
+                "Using greedy selector because only single job has to be scheduled."
+            )
+            return self.job_selector_greedy(jobs)
 
         with self._lock:
             if not self.resources["_cores"]:
@@ -633,30 +497,34 @@ class JobScheduler:
             # assert self.resources["_cores"] > 0
             scheduled_jobs = {
                 job: pulp.LpVariable(
-                    "job_{}".format(idx),
-                    lowBound=0,
-                    upBound=1,
-                    cat=pulp.LpInteger,
+                    f"job_{idx}", lowBound=0, upBound=1, cat=pulp.LpInteger
                 )
                 for idx, job in enumerate(jobs)
             }
 
-            size_gb = lambda f: f.size / 1e9
-
             temp_files = {
-                temp_file for job in jobs for temp_file in self.dag.temp_input(job)
+                temp_file
+                for job in jobs
+                for temp_file in self.workflow.dag.temp_input(job)
             }
+
+            async def get_temp_sizes_gb():
+                return {f: (await f.size()) / 1e9 for f in temp_files}
+
+            temp_sizes_gb = (
+                defaultdict(int) if self.touch else async_run(get_temp_sizes_gb())
+            )
 
             temp_job_improvement = {
                 temp_file: pulp.LpVariable(
-                    "temp_file_{}".format(idx), lowBound=0, upBound=1, cat="Continuous"
+                    f"temp_file_{idx}", lowBound=0, upBound=1, cat="Continuous"
                 )
                 for idx, temp_file in enumerate(temp_files)
             }
 
             temp_file_deletable = {
                 temp_file: pulp.LpVariable(
-                    "deletable_{}".format(idx),
+                    f"deletable_{idx}",
                     lowBound=0,
                     upBound=1,
                     cat=pulp.LpInteger,
@@ -666,10 +534,10 @@ class JobScheduler:
             prob = pulp.LpProblem("JobScheduler", pulp.LpMaximize)
 
             total_temp_size = max(
-                sum([size_gb(temp_file) for temp_file in temp_files]), 1
+                sum([temp_sizes_gb[temp_file] for temp_file in temp_files]), 1
             )
             total_core_requirement = sum(
-                [max(job.resources.get("_cores", 1), 1) for job in jobs]
+                [max(job.scheduler_resources.get("_cores", 1), 1) for job in jobs]
             )
             # Objective function
             # Job priority > Core load
@@ -685,20 +553,21 @@ class JobScheduler:
                 * total_temp_size
                 * lpSum(
                     [
-                        max(job.resources.get("_cores", 1), 1) * scheduled_jobs[job]
+                        max(job.scheduler_resources.get("_cores", 1), 1)
+                        * scheduled_jobs[job]
                         for job in jobs
                     ]
                 )
                 + total_temp_size
                 * lpSum(
                     [
-                        temp_file_deletable[temp_file] * size_gb(temp_file)
+                        temp_file_deletable[temp_file] * temp_sizes_gb[temp_file]
                         for temp_file in temp_files
                     ]
                 )
                 + lpSum(
                     [
-                        temp_job_improvement[temp_file] * size_gb(temp_file)
+                        temp_job_improvement[temp_file] * temp_sizes_gb[temp_file]
                         for temp_file in temp_files
                     ]
                 )
@@ -709,7 +578,7 @@ class JobScheduler:
                 prob += (
                     lpSum(
                         [
-                            scheduled_jobs[job] * job.resources.get(name, 0)
+                            scheduled_jobs[job] * job.scheduler_resources.get(name, 0)
                             for job in jobs
                         ]
                     )
@@ -749,7 +618,9 @@ class JobScheduler:
             return self.job_selector_greedy(jobs)
 
         selected_jobs = set(
-            job for job, variable in scheduled_jobs.items() if variable.value() == 1.0
+            job
+            for job, variable in scheduled_jobs.items()
+            if math.isclose(variable.value(), 1.0)
         )
 
         if not selected_jobs:
@@ -759,7 +630,7 @@ class JobScheduler:
 
         for name in self.workflow.global_resources:
             self.resources[name] -= sum(
-                [job.resources.get(name, 0) for job in selected_jobs]
+                [job.scheduler_resources.get(name, 0) for job in selected_jobs]
             )
         return selected_jobs
 
@@ -767,26 +638,27 @@ class JobScheduler:
         import pulp
 
         old_path = os.environ["PATH"]
-        if self.workflow.scheduler_solver_path is None:
+        if self.workflow.scheduling_settings.solver_path is None:
             # Temporarily prepend the given snakemake env to the path, such that the solver can be found in any case.
             # This is needed for cluster envs, where the cluster job might have a different environment but
             # still needs access to the solver binary.
             os.environ["PATH"] = "{}:{}".format(
-                self.workflow.scheduler_solver_path, os.environ["PATH"]
+                self.workflow.scheduling_settings.solver_path,
+                os.environ["PATH"],
             )
         try:
             solver = (
-                pulp.get_solver(self.scheduler_ilp_solver)
-                if self.scheduler_ilp_solver
+                pulp.getSolver(self.workflow.scheduling_settings.ilp_solver)
+                if self.workflow.scheduling_settings.ilp_solver
                 else pulp.apis.LpSolverDefault
             )
         finally:
             os.environ["PATH"] = old_path
-        solver.msg = self.workflow.verbose
+        solver.msg = self.workflow.output_settings.verbose
         prob.solve(solver)
 
     def required_by_job(self, temp_file, job):
-        return 1 if temp_file in self.dag.temp_input(job) else 0
+        return 1 if temp_file in self.workflow.dag.temp_input(job) else 0
 
     def job_selector_greedy(self, jobs):
         """
@@ -806,7 +678,11 @@ class JobScheduler:
             E = set(range(n))  # jobs still free to select
             u = [1] * n
             a = list(map(self.job_weight, jobs))  # resource usage of jobs
-            c = list(map(self.job_reward, jobs))  # job rewards
+
+            async def rewards():
+                return [await self.job_reward(job) for job in jobs]
+
+            c = async_run(rewards())  # job rewards
 
             def calc_reward():
                 return [c_j * y_j for c_j, y_j in zip(c, y)]
@@ -865,7 +741,7 @@ class JobScheduler:
             raise WorkflowError(
                 "Job needs {name}={res} but only {name}={gres} "
                 "are available. This is likely because two "
-                "jobs are connected via a pipe and have to run "
+                "jobs are connected via a pipe or a service output and have to run "
                 "simultaneously. Consider providing more "
                 "resources (e.g. via --cores).".format(name=name, res=value, gres=gres)
             )
@@ -878,18 +754,28 @@ class JobScheduler:
         ]
 
     def job_weight(self, job):
-        res = job.resources
+        res = job.scheduler_resources
         return [
             self.calc_resource(name, res.get(name, 0)) for name in self.global_resources
         ]
 
-    def job_reward(self, job):
-        if self.touch or self.dryrun or self.workflow.immediate_submit:
+    async def job_reward(self, job):
+        if (
+            self.touch
+            or self.dryrun
+            or self.workflow.remote_execution_settings.immediate_submit
+        ):
             temp_size = 0
             input_size = 0
         else:
-            temp_size = self.dag.temp_size(job)
-            input_size = job.inputsize
+            try:
+                temp_size = await self.workflow.dag.temp_size(job)
+                input_size = await job.inputsize()
+            except FileNotFoundError:
+                # If the file is not yet present, this shall not affect the
+                # job selection.
+                temp_size = 0
+                input_size = 0
 
         # Usually, this should guide the scheduler to first schedule all jobs
         # that remove the largest temp file, then the second largest and so on.
@@ -903,4 +789,4 @@ class JobScheduler:
 
     def progress(self):
         """Display the progress."""
-        logger.progress(done=self.finished_jobs, total=len(self.dag))
+        logger.progress(done=self.finished_jobs, total=len(self.workflow.dag))

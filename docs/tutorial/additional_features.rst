@@ -72,13 +72,14 @@ The repeated measurements occur as subsequent lines in the tab-delimited benchma
 Modularization
 ::::::::::::::
 
-In order to re-use building blocks or simply to structure large workflows, it is sometimes reasonable to **split a workflow into modules**.
+In order to reuse building blocks or simply to structure large workflows, it is sometimes reasonable to **split a workflow into modules**.
 For this, Snakemake provides the ``include`` directive to include another Snakefile into the current one, e.g.:
 
 .. code:: python
 
-    include: "path/to/other.snakefile"
+    include: "path/to/other.smk"
 
+As can be seen, the default file extensions for snakefiles other than the main snakefile is ``.smk``.
 Alternatively, Snakemake allows to **define sub-workflows**.
 A sub-workflow refers to a working directory with a complete Snakemake workflow.
 Output files of that sub-workflow can be used in the current Snakefile.
@@ -132,7 +133,7 @@ with ``envs/samtools.yaml`` defined as
   dependencies:
     - samtools =1.9
 
-.. sidebar:: Note
+.. note::
 
   The conda directive does not work in combination with ``run`` blocks, because
   they have to share their Python environment with the surrounding snakefile.
@@ -141,7 +142,9 @@ When Snakemake is executed with
 
 .. code:: console
 
-  snakemake --use-conda --cores 1
+  snakemake --software-deployment-method conda --cores 1
+  # or the short form
+    snakemake --sdm conda -c 1
 
 it will automatically create required environments and
 activate them before a job is executed.
@@ -182,7 +185,7 @@ For example, the rule ``bwa_map`` could alternatively look like this:
     wrapper:
         "0.15.3/bio/bwa/mem"
 
-.. sidebar:: Note
+.. note::
 
   Updates to the Snakemake wrapper repository are automatically tested via
   `continuous integration <https://en.wikipedia.org/wiki/Continuous_integration>`_.
@@ -191,86 +194,13 @@ The wrapper directive expects a (partial) URL that points to a wrapper in the re
 These can be looked up in the corresponding `database <https://snakemake-wrappers.readthedocs.io>`_.
 The first part of the URL is a Git version tag. Upon invocation, Snakemake
 will automatically download the requested version of the wrapper.
-Furthermore, in combination with ``--use-conda`` (see :ref:`tutorial-conda`),
+Furthermore, in combination with ``--software-deployment-method conda`` (see :ref:`tutorial-conda`),
 the required software will be automatically deployed before execution.
 
-Cluster execution
+Cluster or cloud execution
 :::::::::::::::::
 
-By default, Snakemake executes jobs on the local machine it is invoked on.
-Alternatively, it can execute jobs in **distributed environments, e.g., compute clusters or batch systems**.
-If the nodes share a common file system, Snakemake supports three alternative execution modes.
-
-In cluster environments, compute jobs are usually submitted as shell scripts via commands like ``qsub``.
-Snakemake provides a **generic mode** to execute on such clusters.
-By invoking Snakemake with
-
-.. code:: console
-
-    $ snakemake --cluster qsub --jobs 100
-
-each job will be compiled into a shell script that is submitted with the given command (here ``qsub``).
-The ``--jobs`` flag limits the number of concurrently submitted jobs to 100.
-This basic mode assumes that the submission command returns immediately after submitting the job.
-Some clusters allow to run the submission command in **synchronous mode**, such that it waits until the job has been executed.
-In such cases, we can invoke e.g.
-
-.. code:: console
-
-    $ snakemake --cluster-sync "qsub -sync yes" --jobs 100
-
-The specified submission command can also be **decorated with additional parameters taken from the submitted job**.
-For example, the number of used threads can be accessed in braces similarly to the formatting of shell commands, e.g.
-
-.. code:: console
-
-    $ snakemake --cluster "qsub -pe threaded {threads}" --jobs 100
-
-Alternatively, Snakemake can use the Distributed Resource Management Application API (DRMAA_).
-This API provides a common interface to control various resource management systems.
-The **DRMAA support** can be activated by invoking Snakemake as follows:
-
-.. code:: console
-
-    $ snakemake --drmaa --jobs 100
-
-If available, **DRMAA is preferable over the generic cluster modes** because it provides better control and error handling.
-To support additional cluster specific parametrization, a Snakefile can be complemented by a :ref:`snakefiles-cluster_configuration` file.
-
-Using --cluster-status
-::::::::::::::::::::::
-
-Sometimes you need specific detection to determine if a cluster job completed successfully, failed or is still running.
-Error detection with ``--cluster`` can be improved for edge cases such as timeouts and jobs exceeding memory that are silently terminated by 
-the queueing system.
-This can be achieved with the ``--cluster-status`` option. This takes as input a script and passes a job id as first argument.
-
-The following (simplified) script detects the job status on a given SLURM cluster (>= 14.03.0rc1 is required for ``--parsable``).
-
-.. code:: python
-
-    #!/usr/bin/env python
-    import subprocess
-    import sys
-
-    jobid = sys.argv[1]
-
-    output = str(subprocess.check_output("sacct -j %s --format State --noheader | head -1 | awk '{print $1}'" % jobid, shell=True).strip())
-
-    running_status=["PENDING", "CONFIGURING", "COMPLETING", "RUNNING", "SUSPENDED"]
-    if "COMPLETED" in output:
-      print("success")
-    elif any(r in output for r in running_status):
-      print("running")
-    else:
-      print("failed")
-
-To use this script call snakemake similar to below, where ``status.py`` is the script above.
-
-.. code:: console
-
-    $ snakemake all --jobs 100 --cluster "sbatch --cpus-per-task=1 --parsable" --cluster-status ./status.py
-
+Executing jobs on a cluster or in the cloud is supported by so-called executor plugins, which are distributed and documented via the [Snakemake plugin catalog](https://snakemake.github.io/snakemake-plugin-catalog/).
 
 Constraining wildcards
 ::::::::::::::::::::::

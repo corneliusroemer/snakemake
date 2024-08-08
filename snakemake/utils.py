@@ -1,5 +1,5 @@
 __author__ = "Johannes Köster"
-__copyright__ = "Copyright 2021, Johannes Köster"
+__copyright__ = "Copyright 2022, Johannes Köster"
 __email__ = "johannes.koester@uni-due.de"
 __license__ = "MIT"
 
@@ -8,7 +8,6 @@ import json
 import re
 import inspect
 import textwrap
-import platform
 from itertools import chain
 import collections
 import multiprocessing
@@ -16,13 +15,13 @@ import string
 import shlex
 import sys
 from urllib.parse import urljoin
-from urllib.request import url2pathname
 
-from snakemake.io import regex, Namedlist, Wildcards, _load_configfile
+from snakemake.io import Namedlist, Wildcards
+from snakemake.common.configfile import _load_configfile
 from snakemake.logging import logger
-from snakemake.common import ON_WINDOWS, is_local_file, smart_join
+from snakemake.common import ON_WINDOWS
 from snakemake.exceptions import WorkflowError
-import snakemake
+from snakemake.io import regex_from_filepattern
 
 
 def validate(data, schema, set_default=True):
@@ -39,6 +38,8 @@ def validate(data, schema, set_default=True):
             https://python-jsonschema.readthedocs.io/en/latest/faq/ for more
             information
     """
+    from snakemake.sourcecache import LocalSourceFile, infer_source_file
+
     frame = inspect.currentframe().f_back
     workflow = frame.f_globals.get("workflow")
 
@@ -55,29 +56,28 @@ def validate(data, schema, set_default=True):
             "in order to use the validate directive."
         )
 
-    schemafile = schema
+    schemafile = infer_source_file(schema)
 
-    if not os.path.isabs(schemafile):
-        frame = inspect.currentframe().f_back
+    if isinstance(schemafile, LocalSourceFile) and not schemafile.isabs() and workflow:
         # if workflow object is not available this has not been started from a workflow
-        if workflow:
-            schemafile = smart_join(workflow.current_basedir, schemafile)
+        schemafile = workflow.current_basedir.join(schemafile.get_path_or_uri())
 
-    source = workflow.sourcecache.open(schemafile) if workflow else schemafile
+    source = (
+        workflow.sourcecache.open(schemafile)
+        if workflow
+        else schemafile.get_path_or_uri()
+    )
     schema = _load_configfile(source, filetype="Schema")
-    if is_local_file(schemafile):
+    if isinstance(schemafile, LocalSourceFile):
         resolver = RefResolver(
-            urljoin("file:", schemafile),
+            urljoin("file:", schemafile.get_path_or_uri()),
             schema,
             handlers={
                 "file": lambda uri: _load_configfile(re.sub("^file://", "", uri))
             },
         )
     else:
-        resolver = RefResolver(
-            schemafile,
-            schema,
-        )
+        resolver = RefResolver(schemafile.get_path_or_uri(), schema)
 
     # Taken from https://python-jsonschema.readthedocs.io/en/latest/faq/
     def extend_with_default(validator_class):
@@ -124,7 +124,7 @@ def validate(data, schema, set_default=True):
                             jsonschema.validate(record, schema, resolver=resolver)
                     except jsonschema.exceptions.ValidationError as e:
                         raise WorkflowError(
-                            "Error validating row {} of data frame.".format(i), e
+                            f"Error validating row {i} of data frame.", e
                         )
                 if set_default:
                     newdata = pd.DataFrame(recordlist, data.index)
@@ -157,7 +157,7 @@ def simplify_path(path):
 
 
 def linecount(filename):
-    """Return the number of lines of given file.
+    """Return the number of lines of the given file.
 
     Args:
         filename (str): the path to the file
@@ -187,7 +187,7 @@ def listfiles(pattern, restriction=None, omit_value=None):
             dirname = "."
     else:
         dirname = os.path.dirname(pattern)
-    pattern = re.compile(regex(pattern))
+    pattern = re.compile(regex_from_filepattern(pattern))
 
     for dirpath, dirnames, filenames in os.walk(dirname):
         for f in chain(filenames, dirnames):
@@ -224,7 +224,7 @@ def report(
     defaultenc="utf8",
     template=None,
     metadata=None,
-    **files
+    **files,
 ):
     """Create an HTML report using python docutils.
 
@@ -233,8 +233,8 @@ def report(
     Attention: This function needs Python docutils to be installed for the
     python installation you use with Snakemake.
 
-    All keywords not listed below are intepreted as paths to files that shall
-    be embedded into the document. They keywords will be available as link
+    All keywords not listed below are interpreted as paths to files that shall
+    be embedded into the document. The keywords will be available as link
     targets in the text. E.g. append a file as keyword arg via F1=input[0]
     and put a download link in the text like this:
 
@@ -260,7 +260,7 @@ def report(
     Args:
         text (str):         The "restructured text" as it is expected by python docutils.
         path (str):         The path to the desired output file
-        stylesheet (str):   An optional path to a css file that defines the style of the document. This defaults to <your snakemake install>/report.css. Use the default to get a hint how to create your own.
+        stylesheet (str):   An optional path to a CSS file that defines the style of the document. This defaults to <your snakemake install>/report.css. Use the default to get a hint on how to create your own.
         defaultenc (str):   The encoding that is reported to the browser for embedded text files, defaults to utf8.
         template (str):     An optional path to a docutils HTML template.
         metadata (str):     E.g. an optional author name or email address.
@@ -281,7 +281,7 @@ def report(
         defaultenc=defaultenc,
         template=template,
         metadata=metadata,
-        **files
+        **files,
     )
 
 
@@ -307,7 +307,7 @@ def R(code):
 class SequenceFormatter(string.Formatter):
     """string.Formatter subclass with special behavior for sequences.
 
-    This class delegates formatting of individual elements to another
+    This class delegates the formatting of individual elements to another
     formatter object. Non-list objects are formatted by calling the
     delegate formatter's "format_field" method. List-like objects
     (list, tuple, set, frozenset) are formatted by formatting each
@@ -336,7 +336,7 @@ class SequenceFormatter(string.Formatter):
     def format_field(self, value, format_spec):
         if isinstance(value, Wildcards):
             return ",".join(
-                "{}={}".format(name, value)
+                f"{name}={value}"
                 for name, value in sorted(value.items(), key=lambda item: item[0])
             )
         if isinstance(value, (list, tuple, set, frozenset)):
@@ -426,7 +426,10 @@ def format(_pattern, *args, stepout=1, _quote_all=False, quote_func=None, **kwar
     try:
         return fmt.format(_pattern, *args, **variables)
     except KeyError as ex:
-        if str(ex).strip("'") in variables["wildcards"].keys():
+        if (
+            "wildcards" in variables
+            and str(ex).strip("'") in variables["wildcards"].keys()
+        ):
             raise NameError(
                 "The name '{0}' is unknown in this context. "
                 "Did you mean 'wildcards.{0}'?".format(str(ex).strip("'"))
@@ -465,16 +468,19 @@ def read_job_properties(
 
 def min_version(version):
     """Require minimum snakemake version, raise workflow error if not met."""
-    import pkg_resources
+    from packaging.version import parse
+    from snakemake.common import __version__
 
-    if pkg_resources.parse_version(snakemake.__version__) < pkg_resources.parse_version(
-        version
-    ):
-        raise WorkflowError("Expecting Snakemake version {} or higher.".format(version))
+    if parse(__version__) < parse(version):
+        raise WorkflowError(
+            "Expecting Snakemake version {} or higher (you are currently using {}).".format(
+                version, __version__
+            )
+        )
 
 
 def update_config(config, overwrite_config):
-    """Recursively update dictionary config with overwrite_config.
+    """Recursively update dictionary config with overwrite_config in-place.
 
     See
     https://stackoverflow.com/questions/3232943/update-value-of-a-nested-dictionary-of-varying-depth
@@ -483,18 +489,25 @@ def update_config(config, overwrite_config):
     Args:
       config (dict): dictionary to update
       overwrite_config (dict): dictionary whose items will overwrite those in config
-
     """
 
-    def _update(d, u):
-        for (key, value) in u.items():
+    def _update_config(config, overwrite_config):
+        """Necessary as recursive calls require a return value,
+        but `update_config()` has no return value.
+        """
+        for key, value in overwrite_config.items():
+            if not isinstance(config, collections.abc.Mapping):
+                # the config cannot be updated as it is no dict
+                # -> just overwrite it with the new value
+                config = {}
             if isinstance(value, collections.abc.Mapping):
-                d[key] = _update(d.get(key, {}), value)
+                sub_config = config.get(key, {})
+                config[key] = _update_config(sub_config, value)
             else:
-                d[key] = value
-        return d
+                config[key] = value
+        return config
 
-    _update(config, overwrite_config)
+    _update_config(config, overwrite_config)
 
 
 def available_cpu_count():
@@ -521,9 +534,9 @@ def available_cpu_count():
 
 
 def argvquote(arg, force=True):
-    """Returns an argument quoted in such a way that that CommandLineToArgvW
+    """Returns an argument quoted in such a way that CommandLineToArgvW
     on Windows will return the argument string unchanged.
-    This is the same thing Popen does when supplied with an list of arguments.
+    This is the same thing Popen does when supplied with a list of arguments.
     Arguments in a command line should be separated by spaces; this
     function does not add these spaces. This implementation follows the
     suggestions outlined here:
@@ -572,8 +585,8 @@ def os_sync():
 def find_bash_on_windows():
     """
     Find the path to a usable bash on windows.
-    First attempt is to look for bash installed  with a git conda package.
-    alternatively try bash installed with 'Git for Windows'.
+    The first attempt is to look for a bash installed with a git conda package.
+    Alternatively, try bash installed with 'Git for Windows'.
     """
     if not ON_WINDOWS:
         return None
@@ -601,12 +614,12 @@ class Paramspace:
     By default, a directory structure with on folder level per parameter is created
     (e.g. column1~{column1}/column2~{column2}/***).
 
-    The exact behavior can be tweeked with two parameters:
+    The exact behavior can be tweaked with four parameters:
 
       - ``filename_params`` takes a list of column names of the passed dataframe.
         These names are used to build the filename (separated by '_') in the order
         in which they are passed.
-        All remaining parameters will be used to generate a directoty structure.
+        All remaining parameters will be used to generate a directory structure.
         Example for a data frame with four columns named column1 to column4:
 
         | ``Paramspace(df, filename_params=["column3", "column2"])`` ->
@@ -616,15 +629,40 @@ class Paramspace:
         the filename instead of parent directories.
 
       - ``param_sep`` takes a string which is used to join the column name and
-        column value in the genrated paths (Default: '~'). Example:
+        column value in the generated paths (Default: '~'). Example:
 
         | ``Paramspace(df, param_sep=":")`` ->
         | column1:{value1}/column2:{value2}/column3:{value3}/column4:{value4}
+
+      - ``filename_sep`` takes a string which is used to join the parameter
+        entries listed in ``filename_params`` in the generated paths
+        (Default: '_'). Example:
+
+        | ``Paramspace(df, filename_params="*", filename_sep="-")`` ->
+        | column1~{value1}-column2~{value2}-column3~{value3}-column4~{value4}
+
+      - ``single_wildcard`` takes a string which is used to replace the
+        default behavior of using a wildcard for each column in the dataframe
+        with a single wildcard that is used to encode all column values.
+        The given string is the name of that wildcard. The value of the wildcard
+        for individual instances of the paramspace is still controlled by above
+        other arguments. The single_wildcard mechanism can be handy if you want
+        to define a rule that shall be used for multiple paramspaces with different
+        columns.
     """
 
-    def __init__(self, dataframe, filename_params=None, param_sep="~"):
+    def __init__(
+        self,
+        dataframe,
+        filename_params=None,
+        param_sep="~",
+        filename_sep="_",
+        single_wildcard=None,
+    ):
         self.dataframe = dataframe
         self.param_sep = param_sep
+        self.filename_sep = filename_sep
+        self.single_wildcard = single_wildcard
         if filename_params is None or not filename_params:
             # create a pattern of the form {}/{}/{} with one entry for each
             # column in the dataframe
@@ -636,7 +674,7 @@ class Paramspace:
 
             if any((param not in dataframe.columns for param in filename_params)):
                 raise KeyError(
-                    "One or more entries of filename_params are not valid coulumn names for the param file."
+                    "One or more entries of filename_params are not valid column names for the param file."
                 )
             elif len(set(filename_params)) != len(filename_params):
                 raise ValueError("filename_params must be unique")
@@ -646,7 +684,7 @@ class Paramspace:
             self.pattern = "/".join(
                 [r"{}"] * (len(self.dataframe.columns) - len(filename_params) + 1)
             )
-            self.pattern = "_".join(
+            self.pattern = self.filename_sep.join(
                 [self.pattern] + [r"{}"] * (len(filename_params) - 1)
             )
             self.ordered_columns = [
@@ -662,9 +700,14 @@ class Paramspace:
         """Wildcard pattern over all columns of the underlying dataframe of the form
         column1~{column1}/column2~{column2}/*** or of the provided custom pattern.
         """
-        return self.pattern.format(
-            *map(self.param_sep.join(("{0}", "{{{0}}}")).format, self.ordered_columns)
-        )
+        if self.single_wildcard:
+            return f"{{{self.single_wildcard}}}"
+        else:
+            return self.pattern.format(
+                *map(
+                    self.param_sep.join(("{0}", "{{{0}}}")).format, self.ordered_columns
+                )
+            )
 
     @property
     def instance_patterns(self):
@@ -672,33 +715,63 @@ class Paramspace:
         formatted as file patterns of the form column1~{value1}/column2~{value2}/...
         or of the provided custom pattern.
         """
+        import pandas as pd
+
+        fmt_value = lambda value: "NA" if pd.isna(value) else value
         return (
             self.pattern.format(
                 *(
-                    self.param_sep.join(("{}", "{}")).format(name, value)
-                    for name, value in row.items()
+                    self.param_sep.join(("{}", "{}")).format(name, fmt_value(value))
+                    for name, value in row._asdict().items()
                 )
             )
-            for index, row in self.dataframe.iterrows()
+            for row in self.dataframe.itertuples(index=False)
         )
 
     def instance(self, wildcards):
         """Obtain instance (dataframe row) with the given wildcard values."""
         import pandas as pd
+        from snakemake.io import regex_from_filepattern
 
         def convert_value_dtype(name, value):
             if self.dataframe.dtypes[name] == bool and value == "False":
                 # handle problematic case when boolean False is returned as
                 # boolean True because the string "False" is misinterpreted
                 return False
+            if value == "NA":
+                return pd.NA
             else:
                 return pd.Series([value]).astype(self.dataframe.dtypes[name])[0]
 
-        return {
-            name: convert_value_dtype(name, value)
-            for name, value in wildcards.items()
-            if name in self.ordered_columns
-        }
+        if self.single_wildcard:
+            wildcard_value = wildcards.get(self.single_wildcard)
+            if wildcard_value is None:
+                raise WorkflowError(
+                    f"Error processing paramspace: wildcard {self.single_wildcard} is not used in rule."
+                )
+
+            pattern = self.pattern.format(
+                *(
+                    f"{name}{self.param_sep}{{{name}}}"
+                    for name in self.dataframe.columns
+                )
+            )
+            rexp = re.compile(regex_from_filepattern(pattern))
+            match = rexp.match(wildcard_value)
+            if not match:
+                raise WorkflowError(
+                    f"Error processing paramspace: wildcard {self.single_wildcard}={wildcards.get(self.single_wildcard)} does not match pattern {pattern}."
+                )
+            return {
+                name: convert_value_dtype(name, value)
+                for name, value in match.groupdict().items()
+            }
+        else:
+            return {
+                name: convert_value_dtype(name, value)
+                for name, value in wildcards.items()
+                if name in self.ordered_columns
+            }
 
     def __getattr__(self, name):
         import pandas as pd

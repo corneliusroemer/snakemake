@@ -1,53 +1,136 @@
 __author__ = "Johannes Köster"
-__copyright__ = "Copyright 2021, Johannes Köster"
+__copyright__ = "Copyright 2023, Johannes Köster"
 __email__ = "johannes.koester@protonmail.com"
 __license__ = "MIT"
 
-from functools import update_wrapper
+import contextlib
 import itertools
+import math
+import operator
 import platform
 import hashlib
 import inspect
+import sys
 import uuid
 import os
 import asyncio
-import sys
 import collections
 from pathlib import Path
 
 from snakemake._version import get_versions
 
+from snakemake_interface_common.exceptions import WorkflowError
+
+
+# Temporary silencing of noisy deprecation warning
+# The next few lines till the import can be removed once either
+# of the following issues are resolved:
+# - https://github.com/piskvorky/smart_open/issues/831
+# - https://github.com/paramiko/paramiko/issues/2419
+# See https://github.com/snakemake/snakemake/issues/3004
+try:
+    # Cryptography is an optional snakemake dependency
+    # Hence need to handle the case where it is not installed
+    from cryptography.utils import CryptographyDeprecationWarning
+    import warnings
+    context_manager = warnings.catch_warnings(action="ignore", category=CryptographyDeprecationWarning)
+except ImportError:
+    from contextlib import nullcontext
+    context_manager = nullcontext()
+
+with context_manager:
+    # End of temporary silencing
+    # Deindent the following once the above issues are resolved
+    # Or move the import back to where it is needed
+    from smart_open import parse_uri
+
+
 __version__ = get_versions()["version"]
 del get_versions
 
 
-MIN_PY_VERSION = (3, 5)
-DYNAMIC_FILL = "__snakemake_dynamic__"
-SNAKEMAKE_SEARCHPATH = str(Path(__file__).parent.parent.parent)
+MIN_PY_VERSION = (3, 7)
 UUID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://snakemake.readthedocs.io")
+NOTHING_TO_BE_DONE_MSG = (
+    "Nothing to be done (all requested files are present and up to date)."
+)
 
 ON_WINDOWS = platform.system() == "Windows"
+# limit the number of input/output files list in job properties
+# see https://github.com/snakemake/snakemake/issues/2097
+IO_PROP_LIMIT = 100
+SNAKEFILE_CHOICES = list(
+    map(
+        Path,
+        (
+            "Snakefile",
+            "snakefile",
+            "workflow/Snakefile",
+            "workflow/snakefile",
+        ),
+    )
+)
+PIP_DEPLOYMENTS_PATH = ".snakemake/pip-deployments"
 
 
-if sys.version_info < (3, 7):
-
-    def async_run(coroutine):
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(coroutine)
-
-
-else:
-    async_run = asyncio.run
+def get_snakemake_searchpaths():
+    paths = [str(Path(__file__).parent.parent.parent)] + [
+        path for path in sys.path if os.path.isdir(path)
+    ]
+    return list(unique_justseen(paths))
 
 
-# A string that prints as TBD
-class TBDString(str):
-    # the second arg is necessary to avoid problems when pickling
-    def __new__(cls, _=None):
-        return str.__new__(cls, "<TBD>")
+def mb_to_mib(mb):
+    return int(math.ceil(mb * 0.95367431640625))
+
+
+def parse_key_value_arg(arg, errmsg, strip_quotes=True):
+    try:
+        key, val = arg.split("=", 1)
+    except ValueError:
+        raise ValueError(errmsg + f" (Unparsable value: {repr(arg)})")
+    if strip_quotes:
+        val = val.strip("'\"")
+    return key, val
+
+
+def dict_to_key_value_args(
+    some_dict: dict, quote_str: bool = True, repr_obj: bool = False
+):
+    items = []
+    for key, value in some_dict.items():
+        if repr_obj and not isinstance(value, str):
+            encoded = repr(value)
+        else:
+            encoded = f"'{value}'" if quote_str and isinstance(value, str) else value
+        items.append(f"{key}={encoded}")
+    return items
+
+
+def async_run(coroutine):
+    """Attaches to running event loop or creates a new one to execute a
+    coroutine.
+    .. seealso::
+         https://github.com/snakemake/snakemake/issues/1105
+         https://stackoverflow.com/a/65696398
+    """
+    try:
+        return asyncio.run(coroutine)
+    except RuntimeError as e:
+        coroutine.close()
+        raise WorkflowError(
+            "Error running coroutine in event loop. Snakemake currently does not "
+            "support being executed from an already running event loop. "
+            "If you run Snakemake e.g. from a Jupyter notebook, make sure to spawn a "
+            "separate process for Snakemake.",
+            e,
+        )
 
 
 APPDIRS = None
+
+
+RULEFUNC_CONTEXT_MARKER = "__is_snakemake_rule_func"
 
 
 def get_appdirs():
@@ -64,8 +147,6 @@ def is_local_file(path_or_uri):
 
 
 def parse_uri(path_or_uri):
-    from smart_open import parse_uri
-
     try:
         return parse_uri(path_or_uri)
     except NotImplementedError as e:
@@ -88,9 +169,7 @@ def smart_join(base, path, abspath=False):
             return os.path.abspath(full)
         return full
     else:
-        from smart_open import parse_uri
-
-        uri = parse_uri("{}/{}".format(base, path))
+        uri = parse_uri(f"{base}/{path}")
         if not ON_WINDOWS:
             # Norm the path such that it does not contain any ../,
             # which is invalid in an URL.
@@ -98,7 +177,7 @@ def smart_join(base, path, abspath=False):
             uri_path = os.path.normpath(uri.uri_path)
         else:
             uri_path = uri.uri_path
-        return "{scheme}:/{uri_path}".format(scheme=uri.scheme, uri_path=uri_path)
+        return f"{uri.scheme}:/{uri_path}"
 
 
 def num_if_possible(s):
@@ -117,7 +196,7 @@ def get_last_stable_version():
 
 
 def get_container_image():
-    return "snakemake/snakemake:v{}".format(get_last_stable_version())
+    return f"snakemake/snakemake:v{get_last_stable_version()}"
 
 
 def get_uuid(name):
@@ -156,40 +235,6 @@ def bytesto(bytes, to, bsize=1024):
     return answer
 
 
-class Mode:
-    """
-    Enum for execution mode of Snakemake.
-    This handles the behavior of e.g. the logger.
-    """
-
-    default = 0
-    subprocess = 1
-    cluster = 2
-
-
-class lazy_property(property):
-    __slots__ = ["method", "cached", "__doc__"]
-
-    @staticmethod
-    def clean(instance, method):
-        delattr(instance, method)
-
-    def __init__(self, method):
-        self.method = method
-        self.cached = "_{}".format(method.__name__)
-        super().__init__(method, doc=method.__doc__)
-
-    def __get__(self, instance, owner):
-        cached = (
-            getattr(instance, self.cached) if hasattr(instance, self.cached) else None
-        )
-        if cached is not None:
-            return cached
-        value = self.method(instance)
-        setattr(instance, self.cached, value)
-        return value
-
-
 def strip_prefix(text, prefix):
     if text.startswith(prefix):
         return text[len(prefix) :]
@@ -223,7 +268,22 @@ def group_into_chunks(n, iterable):
 class Rules:
     """A namespace for rules so that they can be accessed via dot notation."""
 
-    pass
+    def __init__(self):
+        self._rules = dict()
+
+    def _register_rule(self, name, rule):
+        self._rules[name] = rule
+
+    def __getattr__(self, name):
+        from snakemake.exceptions import WorkflowError
+
+        try:
+            return self._rules[name]
+        except KeyError:
+            raise WorkflowError(
+                f"Rule {name} is not defined in this workflow. "
+                f"Available rules: {', '.join(self._rules)}"
+            )
 
 
 class Scatter:
@@ -236,3 +296,75 @@ class Gather:
     """A namespace for gather to allow items to be accessed via dot notation."""
 
     pass
+
+
+def get_function_params(func):
+    return inspect.signature(func).parameters
+
+
+def get_input_function_aux_params(func, candidate_params):
+    func_params = get_function_params(func)
+    has_var_keyword = any(
+        param.kind == param.VAR_KEYWORD for param in func_params.values()
+    )
+    if has_var_keyword:
+        # If the function has a **kwargs parameter, we assume that it can take any
+        # parameter, so we return all candidate parameters.
+        return candidate_params
+    else:
+        return {k: v for k, v in candidate_params.items() if k in func_params}
+
+
+def unique_justseen(iterable, key=None):
+    """
+    List unique elements, preserving order. Remember only the element just seen.
+
+    From https://docs.python.org/3/library/itertools.html#itertools-recipes
+    """
+    # unique_justseen('AAAABBBCCDAABBB') --> A B C D A B
+    # unique_justseen('ABBcCAD', str.lower) --> A B c A D
+    return map(next, map(operator.itemgetter(1), itertools.groupby(iterable, key)))
+
+
+# Taken from https://stackoverflow.com/a/34333710/7070491.
+# Thanks to Laurent Laporte.
+@contextlib.contextmanager
+def set_env(**environ):
+    """
+    Temporarily set the process environment variables.
+
+    >>> with set_env(PLUGINS_DIR='test/plugins'):
+    ...   "PLUGINS_DIR" in os.environ
+    True
+
+    >>> "PLUGINS_DIR" in os.environ
+    False
+
+    :type environ: dict[str, unicode]
+    :param environ: Environment variables to set
+    """
+    old_environ = dict(os.environ)
+    os.environ.update(environ)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(old_environ)
+
+
+def expand_vars_and_user(value):
+    if value is not None:
+        return os.path.expanduser(os.path.expandvars(value))
+
+
+# Taken from https://stackoverflow.com/a/2166841/7070491
+# Thanks to Alex Martelli.
+def is_namedtuple_instance(x):
+    t = type(x)
+    b = t.__bases__
+    if len(b) != 1 or b[0] != tuple:
+        return False
+    f = getattr(t, "_fields", None)
+    if not isinstance(f, tuple):
+        return False
+    return all(type(n) is str for n in f)

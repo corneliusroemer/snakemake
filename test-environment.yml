@@ -1,60 +1,49 @@
 channels:
   - conda-forge
   - bioconda
+  - nodefaults
 dependencies:
-  - python >=3.5.3
+  - python >=3.11
+  - mamba
+  - yte
+  - packaging
   - stopit
   - datrie
   - boto3
-  - moto
-  - junit-xml  # needed for S3Mocked
   - httpretty
   - wrapt
   - pyyaml
-  - pytest ==6.1.2
+  - pytest
+  - pytest-mock
   - pytest-cov
+  - pytest-split
   - ftputil
   - pysftp
   - requests
-  - responses <0.12.1 # responses 0.12.1 delivers a "TypeError: cannot unpack non-iterable CallbackResponse object"
-  - dropbox
+  - responses
   - numpy
   - appdirs
   - pytools
   - docutils
   - pygments
-  - pandoc <2.0  # pandoc has changed the CLI API so that it is no longer compatible with the version of r-markdown below
+  - pandoc
   - xorg-libxrender
   - xorg-libxext
   - xorg-libxau
   - xorg-libxdmcp
   - xorg-libsm
   - psutil
-  - google-cloud-storage
-  - google-api-python-client
   - oauth2client
-  - azure-storage-blob
-  - ratelimiter
   - configargparse
   - appdirs
-  - python-irodsclient
-  - cwltool <=3.0.20201203173111 # TODO remove once schema-salad has been updated in conda-forge
   - jsonschema
   - pandas
-  - networkx
-  - pygraphviz
-  - python-kubernetes
   - gitpython
-  - pulp >=2.0
-  - tibanna
+  - pulp >=2.3.1
   - environment-modules
   - nbformat
-  - toposort
-  - mamba
+  - toposort >=1.10
   - crc32c
-  - pip
-  - connection_pool
-  - py-tes
   - requests-mock
   - peppy
   - eido
@@ -62,3 +51,20 @@ dependencies:
   - smart_open
   - filelock
   - tabulate
+  - reretry
+  - graphviz
+  - humanfriendly
+  - throttler
+  - dpath
+  - nodejs # for cwltool
+  - immutables
+  - conda
+  - pip
+  - pip:
+      - cwltool
+      - cwl-utils
+      - snakemake-interface-executor-plugins >=9.1.0
+      - snakemake-executor-plugin-cluster-generic >=1.0.9
+      - snakemake-storage-plugin-http
+      - snakemake-storage-plugin-s3
+      - snakemake-storage-plugin-fs >=1.0.3

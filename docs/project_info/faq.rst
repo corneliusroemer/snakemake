@@ -17,13 +17,36 @@ The key idea is very similar to GNU Make. The workflow is determined automatical
 When you start using Snakemake, please make sure to walk through the :ref:`official tutorial <tutorial>`.
 It is crucial to understand how to properly use the system.
 
+How does Snakemake interpret relative paths?
+--------------------------------------------
+
+Relative paths in Snakemake are interpreted depending on their context.
+
+* Input, output, log, and benchmark files are considered to be relative to the working directory (either the directory in which you have invoked Snakemake or whatever was specified for ``--directory`` or the ``workdir:`` directive).
+* Any other directives (e.g. ``conda:``, ``include:``, ``script:``, ``notebook:``) consider paths to be relative to the Snakefile they are defined in.
+
+If you have to manually specify a file that has to be relative to the currently evaluated Snakefile, you can use ``workflow.source_path(filepath)``.
+
+.. code-block:: python
+
+    rule read_a_file_relative_to_snakefile:
+        input:
+            workflow.source_path("resources/some-file.txt")
+        output:
+            "results/some-output.txt"
+        shell:
+            "somecommand {input} {output}"
+
+
+This will in particular also work in combination with :ref:`modules <snakefiles-modules>`.
+
 Snakemake does not connect my rules as I have expected, what can I do to debug my dependency structure?
 -------------------------------------------------------------------------------------------------------
 
-Since dependencies are inferred implicitly, results can sometimes be suprising when little errors are made in filenames or when input functions raise unexpected errors.
+Since dependencies are inferred implicitly, results can sometimes be surprising when little errors are made in filenames or when input functions raise unexpected errors.
 For debugging such cases, Snakemake provides the command line flag ``--debug-dag`` that leads to printing details each decision that is taken while determining the dependencies.
 
-In addition, it is advisable to check whether certain intermediate files would be created by targetting them individually via the command line.
+In addition, it is advisable to check whether certain intermediate files would be created by targeting them individually via the command line.
 
 Finally, it is possible to constrain the rules that are considered for DAG creating via ``--allowed-rules``. 
 This way, you can easily check rule by rule if it does what you expect.
@@ -251,7 +274,7 @@ The best solution is to have a dictionary that translates a sample id to the inc
 How do I force Snakemake to rerun all jobs from the rule I just edited?
 -----------------------------------------------------------------------
 
-This can be done by invoking Snakemake with the ``--forcerules`` or ``-R`` flag, followed by the rules that should be re-executed:
+This can be done by invoking Snakemake with the ``--forcerun`` or ``-R`` flag, followed by the rules that should be re-executed:
 
 .. code-block:: console
 
@@ -284,7 +307,7 @@ Yes, from version 2.4.8 on, Snakemake allows to import python modules (and also 
 How can I run Snakemake on a cluster where its main process is not allowed to run on the head node?
 ---------------------------------------------------------------------------------------------------
 
-This can be achived by submitting the main Snakemake invocation as a job to the cluster. If it is not allowed to submit a job from a non-head cluster node, you can provide a submit command that goes back to the head node before submitting:
+This can be achieved by submitting the main Snakemake invocation as a job to the cluster. If it is not allowed to submit a job from a non-head cluster node, you can provide a submit command that goes back to the head node before submitting:
 
 .. code-block:: bash
 
@@ -356,7 +379,7 @@ Because of the cluster support and the ability to resume a workflow where you st
         run:
             storage.store("myvar", 3.14)
 
-Here, the output rule b has to be temp in order to ensure that ``myvar`` is stored in each run of the workflow as rule a relies on it. In other words, the PersistentDict is persistent between the job processes, but not between different runs of this workflow. If you need to conserve information between different runs, use output files for them.
+Here, the output rule b has to be temp in order to ensure that ``myvar`` is stored in each run of the workflow as rule a relies on it. In other words, the `PersistentDict` is persistent between the job processes, but not between different runs of this workflow. If you need to conserve information between different runs, use output files for them.
 
 Why do my global variables behave strangely when I run my job on a cluster?
 ---------------------------------------------------------------------------
@@ -433,14 +456,15 @@ Since bash otherwise automatically removes quotes, you have to also wrap the ent
 How do I make my rule fail if an output file is empty?
 ------------------------------------------------------
 
-Snakemake expects shell commands to behave properly, meaning that failures should cause an exit status other than zero. If a command does not exit with a status other than zero, Snakemake assumes everything worked fine, even if output files are empty. This is because empty output files are also a reasonable tool to indicate progress where no real output was produced. However, sometimes you will have to deal with tools that do not properly report their failure with an exit status. Here, the recommended way is to use bash to check for non-empty output files, e.g.:
+Snakemake expects shell commands to behave properly, meaning that failures should cause an exit status other than zero. If a command does not exit with a status other than zero, Snakemake assumes everything worked fine, even if output files are empty. This is because empty output files are also a reasonable tool to indicate progress where no real output was produced. However, sometimes you will have to deal with tools that do not properly report their failure with an exit status. Here, you can use the :ref:`ensure function <snakefiles_ensure>` to mark output files that should not be empty, e.g.:
 
 .. code-block:: python
-
-    rule:
+    rule NAME:
         input:  ...
-        output: "my/output/file.txt"
-        shell:  "somecommand {input} {output} && [[ -s {output} ]]"
+        output:
+            ensure("test.txt", non_empty=True)
+        shell:
+            "somecommand {input} {output}"
 
 
 How does Snakemake lock the working directory?
@@ -449,17 +473,6 @@ How does Snakemake lock the working directory?
 Per default, Snakemake will lock a working directory by output and input files. Two Snakemake instances that want to create the same output file are not possible. Two instances creating disjoint sets of output files are possible.
 With the command line option ``--nolock``, you can disable this mechanism on your own risk. With ``--unlock``, you can be remove a stale lock. Stale locks can appear if your machine is powered off with a running Snakemake instance.
 
-
-Snakemake does not trigger re-runs if I add additional input files. What can I do?
-----------------------------------------------------------------------------------
-
-Snakemake has a kind of "lazy" policy about added input files if their modification date is older than that of the output files. One reason is that information what to do cannot be inferred just from the input and output files. You need additional information about the last run to be stored. Since behaviour would be inconsistent between cases where that information is available and where it is not, this functionality has been encoded as an extra switch. To trigger updates for jobs with changed input files, you can use the command line argument --list-input-changes in the following way:
-
-.. code-block:: console
-
-    $ snakemake -n -R `snakemake --list-input-changes`
-
-Here, ``snakemake --list-input-changes`` returns the list of output files with changed input files, which is fed into ``-R`` to trigger a re-run.
 
 
 How do I trigger re-runs for rules with updated code or parameters?
@@ -518,7 +531,11 @@ If you are just interested in the final summary, you can use the ``--quiet`` fla
 Git is messing up the modification times of my input files, what can I do?
 --------------------------------------------------------------------------
 
-When you checkout a git repository, the modification times of updated files are set to the time of the checkout. If you rely on these files as input **and** output files in your workflow, this can cause trouble. For example, Snakemake could think that a certain (git-tracked) output has to be re-executed, just because its input has been checked out a bit later. In such cases, it is advisable to set the file modification dates to the last commit date after an update has been pulled. One solution is to add the following lines to your ``.bashrc`` (or similar):
+When you checkout a git repository, the modification times of updated files are set to the time of the checkout.
+If you rely on these files as input **and** output files in your workflow, this can cause trouble.
+For example, Snakemake could think that a certain (git-tracked) output has to be re-executed, just because its input has been checked out a bit later.
+In such cases, it is advisable to set the file modification dates to the last commit date after an update has been pulled.
+One solution is to add the following lines to your ``.bashrc`` (or similar):
 
 .. code-block:: bash
 
@@ -534,7 +551,8 @@ When you checkout a git repository, the modification times of updated files are 
         done
     }
 
-(inspired by the answer `here <https://stackoverflow.com/questions/2458042/restore-files-modification-time-in-git/22638823#22638823>`_). You can then run ``gitmodtimes`` to update the modification times of all tracked files on the current branch to their last commit time in git; BE CAREFUL--this does not account for local changes that have not been commited.
+(inspired by the answer `here <https://stackoverflow.com/questions/2458042/restore-files-modification-time-in-git/22638823#22638823>`_).
+You can then run ``gitmodtimes`` to update the modification times of all tracked files on the current branch to their last commit time in git; BE CAREFUL--this does not account for local changes that have not been committed.
 
 How do I exit a running Snakemake workflow?
 -------------------------------------------
@@ -575,6 +593,26 @@ temporary file ``huge_file.csv`` could be kept at the compute node.
 
    $ snakemake --shadow-prefix /scratch some_summary_statistics.txt --cluster ...
 
+If you want the input files of your rule to be copied to the node-local scratch directory
+instead of just using symbolic links, you can use ``copy-minimal`` in the ``shadow`` directive.
+This is useful for example for benchmarking tools as a black-box.
+
+.. code-block:: python
+
+  rule:
+      input:
+          "input_file.txt"
+      output:
+          file = "output_file.txt",
+          benchmark = "benchmark_results.txt",
+      shadow: "copy-minimal"
+      shell:
+          """
+          /usr/bin/time -v command "{input}" "{output.file}" > "{output.benchmark}"
+          """
+
+Executing snakemake as above then leads to the shell script accessing only node-local storage.
+
 How do I access elements of input or output by a variable index?
 ----------------------------------------------------------------
 
@@ -589,7 +627,7 @@ Assuming you have something like the following rule
               for i in range(20):
                   shell("echo test > {output[i]}")
 
-Snakemake will fail upon execution with the error ``'OutputFiles' object has no attribute 'i'``. The reason is that the shell command is using the `Python format mini language <https://docs.python.org/3/library/string.html#formatspec>`_, which does only allow indexing via constants, e.g., ``output[1]``, but not via variables. Variables are treated as attribute names instead. The solution is to write
+Snakemake will fail upon execution with the error ``'OutputFiles' object has no attribute 'i'``. The reason is that the shell command is using the `Python format mini language <https://docs.python.org/3/library/string.html#formatspec>`_, which only allows indexing via constants, e.g., ``output[1]``, but not via variables. Variables are treated as attribute names instead. The solution is to write
 
    .. code-block:: python
 
@@ -646,3 +684,11 @@ Say you have forgotten how to use the various options starting ``force``, just t
 To activate this autocompletion permanently, put this line in ``~/.zshrc``.
 
 `Here <https://github.com/zsh-users/zsh-completions/blob/master/zsh-completions-howto.org>`_ is some further reading.
+
+How can I avoid system /tmp to be used when combining apptainer and conda?
+--------------------------------------------------------------------------
+
+When using both apptainer and conda the idea is that inside the apptainer container the conda environment is being installed.
+Some apptainer instances are set to share the system /tmp with the containers.
+This can lead to unexpected behaviour where the system /tmp gets full.
+To stop this behaviour you'd have to run apptainer with the ``--contain`` option. 

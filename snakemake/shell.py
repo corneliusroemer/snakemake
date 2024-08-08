@@ -1,8 +1,9 @@
 __author__ = "Johannes Köster"
-__copyright__ = "Copyright 2021, Johannes Köster"
+__copyright__ = "Copyright 2022, Johannes Köster"
 __email__ = "johannes.koester@uni-due.de"
 __license__ = "MIT"
 
+from pathlib import Path
 import _io
 import sys
 import os
@@ -13,8 +14,8 @@ import stat
 import tempfile
 import threading
 
-from snakemake.utils import format, argvquote, cmd_exe_quote, find_bash_on_windows
-from snakemake.common import ON_WINDOWS
+from snakemake.utils import format, argvquote, cmd_exe_quote
+from snakemake.common import ON_WINDOWS, RULEFUNC_CONTEXT_MARKER
 from snakemake.logging import logger
 from snakemake.deployment import singularity
 from snakemake.deployment.conda import Conda
@@ -40,11 +41,11 @@ MAX_ARG_LEN = 16 * 4096 - 1
 
 class shell:
     _process_args = {}
-    _process_prefix = ""
+    _process_prefix = None
     _process_suffix = ""
+    _win_command_prefix = ""
     _lock = threading.Lock()
     _processes = {}
-    _win_command_prefix = ""
     conda_block_conflicting_envvars = True
 
     @classmethod
@@ -55,37 +56,77 @@ class shell:
     def check_output(cls, cmd, **kwargs):
         executable = cls.get_executable()
         if ON_WINDOWS and executable:
-            cmd = '"{}" {} {}'.format(
-                executable, cls._win_command_prefix, argvquote(cmd)
-            )
+            win_prefix = cls._get_win_command_prefix()
+            cmd = f'"{executable}" {win_prefix} {argvquote(cmd)}'
+            logger.debug(f"Executing: {cmd}")
             return sp.check_output(cmd, shell=False, executable=executable, **kwargs)
         else:
             return sp.check_output(cmd, shell=True, executable=executable, **kwargs)
 
     @classmethod
     def executable(cls, cmd):
+        if isinstance(cmd, Path):
+            cmd = str(cmd)
         if cmd and not os.path.isabs(cmd):
             # always enforce absolute path
             cmd = shutil.which(cmd)
             if not cmd:
                 raise WorkflowError(
-                    "Cannot set default shell {} because it "
-                    "is not available in your "
-                    "PATH.".format(cmd)
+                    f"Cannot set default shell {cmd} because it is not available in your PATH."
                 )
-        if ON_WINDOWS:
-            if cmd is None:
-                cls._process_prefix = ""
-                cls._win_command_prefix = ""
-            elif os.path.split(cmd)[-1].lower() in ("bash", "bash.exe"):
-                if cmd == r"C:\Windows\System32\bash.exe":
-                    raise WorkflowError(
-                        "Cannot use WSL bash.exe on Windows. Ensure that you have "
-                        "a usable bash.exe availble on your path."
-                    )
-                cls._process_prefix = "set -euo pipefail; "
-                cls._win_command_prefix = "-c"
         cls._process_args["executable"] = cmd
+        logger.debug(f"Setting shell executable to {cmd}.")
+
+    @classmethod
+    def _get_process_prefix(cls, shell_exec=None):
+        shell_exec = cls._get_executable_name(shell_exec)
+        if (
+            shell_exec == "bash" or (ON_WINDOWS and shell_exec == "bash.exe")
+        ) and cls._process_prefix is None:
+            return "set -euo pipefail; "
+        else:
+            return cls._process_prefix or ""
+
+    @classmethod
+    def _get_win_command_prefix(cls, use_default=False, shell_exec=None):
+        assert ON_WINDOWS
+        if use_default or (cls._win_command_prefix and shell_exec is None):
+            # use whatever is the default
+            return cls._win_command_prefix
+        shell_exec = cls._get_executable_name(shell_exec)
+        if shell_exec == "bash" or shell_exec == "bash.exe":
+            return "-c"
+        else:
+            return ""
+
+    @classmethod
+    def _check_executable(cls, shell_exec=None):
+        shell_exec = shell_exec or cls.get_executable()
+        if shell_exec is not None:
+            if ON_WINDOWS and shell_exec == r"C:\Windows\System32\bash.exe":
+                raise WorkflowError(
+                    "Cannot use WSL bash.exe on Windows. Ensure that you have "
+                    "a usable bash.exe available on your path."
+                )
+            if not os.path.isabs(shell_exec):
+                path = shutil.which(shell_exec)
+                if not path:
+                    raise WorkflowError(
+                        f"Cannot set shell to {shell_exec} because it is not "
+                        "available in your PATH."
+                    )
+            elif not os.path.exists(shell_exec):
+                raise WorkflowError(
+                    f"Cannot set shell to {shell_exec} because it does not exist."
+                )
+
+    @classmethod
+    def _get_executable_name(cls, shell_exec=None):
+        shell_exec = shell_exec or cls.get_executable()
+        if shell_exec:
+            return os.path.split(shell_exec)[-1].lower()
+        else:
+            return None
 
     @classmethod
     def prefix(cls, prefix):
@@ -97,7 +138,7 @@ class shell:
 
     @classmethod
     def win_command_prefix(cls, cmd):
-        """The command prefix used on windows when specifing a explicit
+        """The command prefix used on windows when specifying a explicit
         shell executable. This would be "-c" for bash.
         Note: that if no explicit executable is set commands are executed
         with Popen(..., shell=True) which uses COMSPEC on windows where this
@@ -110,6 +151,13 @@ class shell:
         with cls._lock:
             if jobid in cls._processes:
                 cls._processes[jobid].kill()
+                del cls._processes[jobid]
+
+    @classmethod
+    def terminate(cls, jobid):
+        with cls._lock:
+            if jobid in cls._processes:
+                cls._processes[jobid].terminate()
                 del cls._processes[jobid]
 
     @classmethod
@@ -128,16 +176,25 @@ class shell:
             kwargs["quote_func"] = cmd_exe_quote
 
         cmd = format(cmd, *args, stepout=2, **kwargs)
-        context = inspect.currentframe().f_back.f_locals
-        # add kwargs to context (overwriting the locals of the caller)
-        context.update(kwargs)
 
         stdout = sp.PIPE if iterable or read else STDOUT
 
         close_fds = sys.platform != "win32"
 
+        func_context = inspect.currentframe().f_back.f_locals
+
+        if func_context.get(RULEFUNC_CONTEXT_MARKER):
+            # If this comes from a rule, we expect certain information to be passed
+            # implicitly via the rule func context, which is added here.
+            context = func_context
+        else:
+            # Otherwise, context is just filled via kwargs.
+            context = dict()
+        # add kwargs to context (overwriting the locals of the caller)
+        context.update(kwargs)
+
         jobid = context.get("jobid")
-        if not context.get("is_shell"):
+        if not context.get("is_shell") and jobid is not None:
             logger.shellcmd(cmd)
 
         conda_env = context.get("conda_env", None)
@@ -146,23 +203,41 @@ class shell:
         env_modules = context.get("env_modules", None)
         shadow_dir = context.get("shadow_dir", None)
         resources = context.get("resources", {})
+        singularity_args = context.get("singularity_args", "")
+        threads = context.get("threads", 1)
 
-        cmd = " ".join((cls._process_prefix, cmd, cls._process_suffix)).strip()
+        shell_executable = resources.get("shell_exec")
+        if shell_executable is not None:
+            process_args = dict(cls._process_args)
+            process_args["executable"] = shell_executable
+        else:
+            shell_executable = cls.get_executable()
+            process_args = cls._process_args
 
-        if env_modules:
+        cls._check_executable(shell_executable)
+
+        cmd = " ".join(
+            (cls._get_process_prefix(shell_executable), cmd, cls._process_suffix)
+        ).strip()
+
+        # If the executor is the submit executor or the jobstep executor for the SLURM
+        # backend, we do not want the environment modules to be activated:
+        # if the rule requires a Python module, snakemake's environment might be
+        # incompatible with the module's environment.
+        if env_modules and "slurm" not in (item.filename for item in inspect.stack()):
             cmd = env_modules.shellcmd(cmd)
-            logger.info("Activating environment modules: {}".format(env_modules))
+            logger.info(f"Activating environment modules: {env_modules}")
 
         if conda_env:
             if ON_WINDOWS and not cls.get_executable():
-                # If we use cmd.exe directly on winodws we need to prepend batch activation script.
-                cmd = Conda(container_img, prefix_path=conda_base_path).shellcmd_win(
-                    conda_env, cmd
-                )
+                # If we use cmd.exe directly on windows we need to prepend batch activation script.
+                cmd = Conda(
+                    container_img=container_img, prefix_path=conda_base_path
+                ).shellcmd_win(conda_env, cmd)
             else:
-                cmd = Conda(container_img, prefix_path=conda_base_path).shellcmd(
-                    conda_env, cmd
-                )
+                cmd = Conda(
+                    container_img=container_img, prefix_path=conda_base_path
+                ).shellcmd(conda_env, cmd)
 
         tmpdir = None
         if len(cmd.replace("'", r"'\''")) + 2 > MAX_ARG_LEN:
@@ -174,25 +249,25 @@ class shell:
             cmd = '"{}" "{}"'.format(cls.get_executable() or "/bin/sh", script)
 
         if container_img:
-            args = context.get("singularity_args", "")
             cmd = singularity.shellcmd(
                 container_img,
                 cmd,
-                args,
+                singularity_args,
                 envvars=None,
-                shell_executable=cls._process_args["executable"],
+                shell_executable=shell_executable,
                 container_workdir=shadow_dir,
+                is_python_script=context.get("is_python_script", False),
             )
-            logger.info("Activating singularity image {}".format(container_img))
+            logger.info(f"Activating singularity image {container_img}")
         if conda_env:
-            logger.info("Activating conda environment: {}".format(conda_env))
+            logger.info(f"Activating conda environment: {os.path.relpath(conda_env)}")
 
-        threads = str(context.get("threads", 1))
         tmpdir_resource = resources.get("tmpdir", None)
         # environment variable lists for linear algebra libraries taken from:
         # https://stackoverflow.com/a/53224849/2352071
         # https://github.com/xianyi/OpenBLAS/tree/59243d49ab8e958bb3872f16a7c0ef8c04067c0a#setting-the-number-of-threads-using-environment-variables
         envvars = dict(os.environ)
+        threads = str(threads)
         envvars["OMP_NUM_THREADS"] = threads
         envvars["GOTO_NUM_THREADS"] = threads
         envvars["OPENBLAS_NUM_THREADS"] = threads
@@ -206,6 +281,17 @@ class shell:
             envvars["TEMPDIR"] = tmpdir_resource
             envvars["TEMP"] = tmpdir_resource
 
+        if "additional_envvars" in kwargs:
+            env = kwargs["additional_envvars"]
+            if not isinstance(env, dict) or not all(
+                isinstance(v, str) for v in env.values()
+            ):
+                raise WorkflowError(
+                    "Given environment variables for shell command have to be a dict of strings, "
+                    "but the following was provided instead:\n{}".format(env)
+                )
+            envvars.update(env)
+
         if conda_env and cls.conda_block_conflicting_envvars:
             # remove envvars that conflict with conda
             for var in ["R_LIBS", "PYTHONPATH", "PERLLIB", "PERL5LIB"]:
@@ -215,13 +301,18 @@ class shell:
                     pass
 
         use_shell = True
-        if ON_WINDOWS and cls.get_executable():
+        if ON_WINDOWS and shell_executable:
             # If executable is set on Windows shell mode can not be used
             # and the executable should be prepended the command together
             # with a command prefix (e.g. -c for bash).
             use_shell = False
+            win_prefix = cls._get_win_command_prefix(
+                use_default=False, shell_exec=shell_executable
+            )
             cmd = '"{}" {} {}'.format(
-                cls.get_executable(), cls._win_command_prefix, argvquote(cmd)
+                shell_executable,
+                win_prefix,
+                argvquote(cmd),
             )
 
         proc = sp.Popen(
@@ -231,7 +322,7 @@ class shell:
             stdout=stdout,
             universal_newlines=iterable or read or None,
             close_fds=close_fds,
-            **cls._process_args,
+            **process_args,
             env=envvars,
         )
 
@@ -257,7 +348,10 @@ class shell:
 
         if jobid is not None:
             with cls._lock:
-                del cls._processes[jobid]
+                try:
+                    del cls._processes[jobid]
+                except KeyError:
+                    pass
 
         if retcode:
             raise sp.CalledProcessError(retcode, cmd)

@@ -67,7 +67,7 @@ For example
     $ snakemake --cores 10
 
 
-.. sidebar:: Note
+.. note::
 
   Apart from the very common thread resource, Snakemake provides a ``resources`` directive that can be used to **specify arbitrary resources**, e.g., memory usage or auxiliary computing devices like GPUs.
   Similar to threads, these can be considered by the scheduler when an available amount of that resource is given with the command line argument ``--resources`` (see :ref:`snakefiles-resources`).
@@ -76,7 +76,7 @@ would execute the workflow with 10 cores.
 Since the rule ``bwa_map`` needs 8 threads, only one job of the rule can run at a time, and the Snakemake scheduler will try to saturate the remaining cores with other jobs like, e.g., ``samtools_sort``.
 The threads directive in a rule is interpreted as a maximum: when **less cores than threads** are provided, the number of threads a rule uses will be **reduced to the number of given cores**.
 
-If ``--cores`` is given without a number, all available cores are used.
+If ``--cores all`` is given, all available cores are used.
 
 Exercise
 ........
@@ -118,7 +118,7 @@ Now, we can remove the statement defining ``SAMPLES`` from the Snakefile and cha
         output:
             "calls/all.vcf"
         shell:
-            "samtools mpileup -g -f {input.fa} {input.bam} | "
+            "bcftools mpileup -f {input.fa} {input.bam} | "
             "bcftools call -mv - > {output}"
 
 .. _tutorial-input_functions:
@@ -156,17 +156,6 @@ For the rule ``bwa_map`` this works as follows:
         shell:
             "bwa mem -t {threads} {input} | samtools view -Sb - > {output}"
 
-.. sidebar:: Note
-
-  Snakemake does not automatically rerun jobs when new input files are added as
-  in the excercise below. However, you can get a list of output files that
-  are affected by such changes with ``snakemake --list-input-changes``.
-  To trigger a rerun, this bit of bash magic helps:
-
-  .. code:: console
-
-    snakemake -n --forcerun $(snakemake --list-input-changes)
-
 Any normal function would work as well.
 Input functions take as **single argument** a ``wildcards`` object, that allows to access the wildcards values via attributes (here ``wildcards.sample``).
 They have to **return a string or a list of strings**, that are interpreted as paths to input files (here, we return the path that is stored for the sample in the config file).
@@ -176,7 +165,7 @@ Input functions are evaluated once the wildcard values of a job are determined.
 Exercise
 ........
 
-* In the ``data/samples`` folder, there is an additional sample ``C.fastq``. Add that sample to the config file and see how Snakemake wants to recompute the part of the workflow belonging to the new sample, when invoking with ``snakemake -n --reason --forcerun bcftools_call``.
+* In the ``data/samples`` folder, there is an additional sample ``C.fastq``. Add that sample to the config file and see how Snakemake wants to recompute the part of the workflow belonging to the new sample, when invoking with ``snakemake -n --forcerun bcftools_call``.
 
 Step 4: Rule parameters
 :::::::::::::::::::::::
@@ -192,7 +181,7 @@ We modify the rule ``bwa_map`` accordingly:
     rule bwa_map:
         input:
             "data/genome.fa",
-            lambda wildcards: config["samples"][wildcards.sample]
+            get_bwa_map_input_fastqs
         output:
             "mapped_reads/{sample}.bam"
         params:
@@ -201,7 +190,7 @@ We modify the rule ``bwa_map`` accordingly:
         shell:
             "bwa mem -R '{params.rg}' -t {threads} {input} | samtools view -Sb - > {output}"
 
-.. sidebar:: Note
+.. note::
 
   The ``params`` directive can also take functions like in Step 3 to defer
   initialization to the DAG phase. In contrast to input functions, these can
@@ -239,7 +228,7 @@ We modify our rule ``bwa_map`` as follows:
             "(bwa mem -R '{params.rg}' -t {threads} {input} | "
             "samtools view -Sb - > {output}) 2> {log}"
 
-.. sidebar:: Note
+.. note::
 
   It is best practice to store all log files in a subdirectory ``logs/``, prefixed by the rule or tool name.
 
@@ -384,7 +373,7 @@ With this, the final version of our workflow in the ``Snakefile`` looks like thi
         log:
             "logs/bcftools_call/all.log"
         shell:
-            "(samtools mpileup -g -f {input.fa} {input.bam} | "
+            "(bcftools mpileup -f {input.fa} {input.bam} | "
             "bcftools call -mv -P {params.rate} - > {output}) 2> {log}"
 
 

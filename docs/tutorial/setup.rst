@@ -50,29 +50,35 @@ To go through this tutorial, you need the following software installed:
 
 However, don't install any of these this manually now, we guide you through better ways below.
 
+.. _tutorial-free-on-gitpod:
+
 Run tutorial for free in the cloud via Gitpod
 :::::::::::::::::::::::::::::::::::::::::::::
 
-.. sidebar:: Note
+.. note::
 
     A common thing to happen while using the development environment in GitPod is to hit ``Ctrl-s`` while in the terminal window, because you wanted to save a file in the editor window.
     This will freeze up you terminal.
     To get it back, make sure you selected the terminal window by clicking on it and then hit ``Ctrl-q``.
 
-The easiest way to run this tutorial is to use Gitpod, which enables performing the excercises via your browser---including all required software, for free and in the cloud.
+The easiest way to run this tutorial is to use Gitpod, which enables performing the exercises via your browser---including all required software, for free and in the cloud.
 In order to do this, simply open the predefined `snakemake-tutorial GitPod workspace <https://gitpod.io/#https://github.com/snakemake/snakemake-tutorial-data>`_ in your browser.
 GitPod provides you with a `Theia development environment <https://theia-ide.org/docs>`_, which you can learn about in the linked documentation.
-Once you have a basic understanding of this environment, you can go on directy with :ref:`tutorial-basics`.
+Once you have a basic understanding of this environment, you can go on directly with :ref:`tutorial-basics`.
 
 Running the tutorial on your local machine
 ::::::::::::::::::::::::::::::::::::::::::
 
 If you prefer to run the tutorial on your local machine, please follow the steps below.
 
-The easiest way to set these prerequisites up, is to use the Mambaforge_ Python 3 distribution 
+The easiest way to set these prerequisites up, is to use the Mambaforge_ Python 3 distribution
 (Mambaforge_ is a Conda based distribution like Miniconda_, which however uses Mamba_ a fast and more robust replacement for the Conda_ package manager).
 The tutorial assumes that you are using either Linux or MacOS X.
 Both Snakemake and Mambaforge_ work also under Windows, but the Windows shell is too different to be able to provide generic examples.
+
+**Currently, the setup currently only works for Intel based machines (x86_64), not ARM based machines like the new Apple M1/2/3 architecture.**
+This will change in the coming months. In the meantime, if you are on an ARM based Mac, you can use Rosetta to emulate an intel architecture.
+Otherwise, you can simply use the Gitpod approach outlined above.
 
 Setup on Windows
 ::::::::::::::::
@@ -120,7 +126,7 @@ Assuming that you have a 64-bit system, on Linux, download and install Miniconda
 
 .. code:: console
 
-    $ wget https://github.com/conda-forge/miniforge/releases/latest/download/Mambaforge-Linux-x86_64.sh
+    $ curl -L https://github.com/conda-forge/miniforge/releases/latest/download/Mambaforge-Linux-x86_64.sh -o Mambaforge-Linux-x86_64.sh
     $ bash Mambaforge-Linux-x86_64.sh
 
 On MacOS with x86_64 architecture, download and install with
@@ -165,11 +171,21 @@ First, we download some example data on which the workflow shall be executed:
 
 .. code:: console
 
-    $ wget https://github.com/snakemake/snakemake-tutorial-data/archive/v5.24.1.tar.gz
-    $ tar --wildcards -xf v5.24.1.tar.gz --strip 1 "*/data" "*/environment.yaml"
+    $ curl -L https://api.github.com/repos/snakemake/snakemake-tutorial-data/tarball -o snakemake-tutorial-data.tar.gz
+
+Next we extract the data. On Linux, run
+
+.. code:: console
+
+    $ tar --wildcards -xf snakemake-tutorial-data.tar.gz --strip 1 "*/data" "*/environment.yaml"
+
+On MacOS, run
+
+.. code:: console
+
+    $ tar -xf snakemake-tutorial-data.tar.gz --strip 1 "*/data" "*/environment.yaml"
 
 This will create a folder ``data`` and a file ``environment.yaml`` in the working directory.
-If your tar command does not provide a ``--wildcards`` flag, you can also just unpack the file without it (which will just leave some more unneeded files in the working directory).
 
 Step 3: Creating an environment with the required software
 ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
@@ -186,7 +202,7 @@ The ``environment.yaml`` file that you have obtained with the previous step (Ste
 
     $ mamba env create --name snakemake-tutorial --file environment.yaml
 
-If you don't have the Mamba_ command because you used a different conda distribution than Mambaforge_, you can also first install Mamba_ 
+If you don't have the Mamba_ command because you used a different conda distribution than Mambaforge_, you can also first install Mamba_
 (which is a faster and more robust replacement for Conda_) in your base environment with
 
 .. code:: console
